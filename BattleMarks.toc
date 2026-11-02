@@ -1,0 +1,6 @@
+## Interface: 11200
+## Title: |cff66ccffBattle|rMarks
+## Notes: Azeroth Survivors: puts a raid marker on every hero of a co-op party, you included, when the match loads, a skull on bosses, and tells the party in chat. Minimap button or /bmarks for settings.
+## Version: 0.4.0
+## SavedVariables: BattleMarksDB
+BattleMarks.lua
