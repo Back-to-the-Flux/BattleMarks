@@ -1,3 +1,5 @@
+<img src="assets/icon.png" alt="BattleMarks icon" width="96" align="right">
+
 # BattleMarks
 
 A raid-marker addon for **Azeroth Survivors** co-op (WoW 1.12.1 client, benilla).
