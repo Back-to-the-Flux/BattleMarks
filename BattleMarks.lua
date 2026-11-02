@@ -1,8 +1,9 @@
 -- BattleMarks (formerly PartyMarks): a raid marker on every hero of a co-op party, you included,
 -- when the match loads.
 -- You choose your own marker; the others get the free ones in order. Markers are set at the start
--- and for heroes who join later; changes made by hand stay until the next match. Bosses get the
--- skull (a second boss up at once the cross), and the markers can be announced in party chat.
+-- and for heroes who join later; changes made by hand stay until the next match. The top boss gets
+-- the skull and the second the cross (guardians when no boss is up), solo too if you like, and the
+-- markers can be announced in party chat.
 -- When several heroes run BattleMarks, one of them sets the markers (the leader, else the first by
 -- name) and honours everyone's chosen marker. WoW 1.12 / Lua 5.0.
 
@@ -13,7 +14,8 @@ local PASSES = { 2.5, 5, 8, 12 }   -- seconds after a start or a join: party uni
 local BOSS_MARKS = { 8, 7 }        -- skull for the first boss, cross for a second one up at once
 local ICONS = "Interface\\TargetingFrame\\UI-RaidTargetingIcons"
 
-local defaults = { enabled = true, mine = 1, button = true, btnAngle = 160, bosses = true, announce = true }
+local defaults = { enabled = true, mine = 1, button = true, btnAngle = 160, bosses = true, bossesSolo = true,
+  announce = true }
 local db
 
 local function Print(msg) DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffBattleMarks|r " .. msg) end
@@ -133,44 +135,99 @@ local function Clear()
 end
 
 -- ---------------------------------------------------------------- the bosses' markers
--- 1.12 can mark an enemy only through a unit: yours or a party hero's target, or your mouseover.
--- Each boss is marked once while it lives, so a marker moved by hand stays where it was put.
-local bossDone = {}   -- boss name -> true once marked
+-- Skull on the top target, cross on the second: the final boss, then the other bosses in spawn
+-- order; with no boss up, the awake guardians. When one dies the next moves up (the cross boss
+-- to skull, an unmarked third to cross), and a boss coming up takes the markers from guardians.
+-- 1.12 can mark an enemy only through a unit (a target, the mouseover), so a marker goes up once
+-- someone targets its enemy; and the game tells a guardian from an elite only for your target.
+-- Each placement is made once, so a marker moved by hand stays until the targets change.
+local applied = {}   -- marker -> name it was placed on for the current targets
+local held = {}      -- marker -> { name, kind } it was last placed on
 
-local function MarkBosses()
-  if not db.bosses or GetNumPartyMembers() == 0 then return end
-  if type(AZS_GetBosses) ~= "function" or type(AZS_UnitKind) ~= "function" then return end
-  local ok, list = pcall(AZS_GetBosses)
-  if not ok or type(list) ~= "table" then return end
-  -- the final boss first, then the others in spawn order
-  local want, alive, n = {}, {}, 0
-  for pass = 1, 2 do
-    for i = 1, table.getn(list) do
-      local b = list[i]
-      if b.name then
-        alive[b.name] = true
-        if ((pass == 1) == (b.final == true)) and not want[b.name] and n < table.getn(BOSS_MARKS) then
-          n = n + 1
-          want[b.name] = BOSS_MARKS[n]
+-- who should hold the bosses' markers, top first
+local function Targets()
+  local list, awake = {}, {}
+  if type(AZS_GetBosses) == "function" then
+    local ok, bosses = pcall(AZS_GetBosses)
+    if ok and type(bosses) == "table" then
+      for pass = 1, 2 do
+        for i = 1, table.getn(bosses) do
+          local b = bosses[i]
+          if b.name and ((pass == 1) == (b.final == true)) then
+            table.insert(list, { name = b.name, kind = "boss" })
+          end
         end
       end
     end
   end
-  for name in pairs(bossDone) do
-    if not alive[name] then bossDone[name] = nil end
+  if type(AZS_GetGuardians) == "function" then
+    local ok, guardians = pcall(AZS_GetGuardians)
+    if ok and type(guardians) == "table" then
+      local noBoss = table.getn(list) == 0
+      for i = 1, table.getn(guardians) do
+        local g = guardians[i]
+        if g.name and g.awake then
+          awake[g.name] = true
+          if noBoss then table.insert(list, { name = g.name, kind = "guardian" }) end
+        end
+      end
+    end
   end
-  if n == 0 then return end
-  local units = { "target", "mouseover" }
+  return list, awake
+end
+
+local function EnemyUnits()
+  local units = { "target", "mouseover", "pettarget" }
   for i = 1, GetNumPartyMembers() do table.insert(units, "party" .. i .. "target") end
-  for i = 1, table.getn(units) do
-    local u = units[i]
-    local name = UnitExists(u) and not UnitIsDead(u) and UnitName(u)
-    local icon = name and want[name]
-    if icon and not bossDone[name] then
-      local okKind, kind = pcall(AZS_UnitKind, u)
-      if okKind and (kind == "boss" or kind == "final") then
-        if GetRaidTargetIndex(u) ~= icon then SetRaidTarget(u, icon) end
-        bossDone[name] = true
+  return units
+end
+
+local function IsKind(u, kind)
+  local ok, k = pcall(AZS_UnitKind, u)
+  if not ok then return false end
+  if kind == "boss" then return k == "boss" or k == "final" end
+  return k == kind
+end
+
+local function MarkBosses()
+  if not db.bosses or type(AZS_UnitKind) ~= "function" then return end
+  if GetNumPartyMembers() == 0 and not db.bossesSolo then return end
+  local targets, awake = Targets()
+  local want = {}
+  for i = 1, table.getn(BOSS_MARKS) do want[BOSS_MARKS[i]] = targets[i] end
+  local units = EnemyUnits()
+  for i = 1, table.getn(BOSS_MARKS) do
+    local icon = BOSS_MARKS[i]
+    local t = want[icon]
+    if not t then
+      applied[icon] = nil
+      -- nobody should hold it: a guardian still wearing it loses it once it's in reach
+      local h = held[icon]
+      if h and h.kind == "guardian" and awake[h.name] then
+        for j = 1, table.getn(units) do
+          local u = units[j]
+          if UnitExists(u) and UnitName(u) == h.name and GetRaidTargetIndex(u) == icon then
+            SetRaidTarget(u, 0)
+            held[icon] = nil
+            break
+          end
+        end
+      else
+        held[icon] = nil
+      end
+    elseif applied[icon] ~= t.name then
+      for j = 1, table.getn(units) do
+        local u = units[j]
+        if UnitExists(u) and not UnitIsDead(u) and UnitName(u) == t.name and IsKind(u, t.kind) then
+          -- two targets of one name: leave the one already wearing the other marker
+          local now = GetRaidTargetIndex(u)
+          local twin = now and now ~= icon and want[now] and want[now].name == t.name and applied[now] == t.name
+          if not twin then
+            if now ~= icon then SetRaidTarget(u, icon) end
+            applied[icon], held[icon] = t.name, t
+            break
+          end
+        end
       end
     end
   end
@@ -193,7 +250,7 @@ local function Announce()
   end
   if table.getn(parts) == 0 then return end
   local msg = "Markers: " .. table.concat(parts, ", ")
-  if first and db.bosses then msg = msg .. ". Skull = boss." end
+  if first and db.bosses then msg = msg .. ". Skull = top boss, Cross = second." end
   SendChatMessage(msg, "PARTY")
 end
 
@@ -223,7 +280,7 @@ end
 
 local function Start(keep)
   users = { [Me()] = db.mine }
-  announced, bossDone = {}, {}
+  announced, applied, held = {}, {}, {}
   -- after a /reload mid-match the markers were already announced
   if keep then
     local units = Members()
@@ -330,7 +387,7 @@ end
 -- ---------------------------------------------------------------- the settings window
 local cfg = CreateFrame("Frame", "BattleMarksConfig", UIParent)
 cfg:SetWidth(310)
-cfg:SetHeight(400)
+cfg:SetHeight(424)
 cfg:SetPoint("CENTER", UIParent, "CENTER", 0, 60)
 cfg:SetFrameStrata("DIALOG")
 cfg:SetBackdrop({ bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -351,10 +408,12 @@ title:SetText("BattleMarks")
 local close = CreateFrame("Button", nil, cfg, "UIPanelCloseButton")
 close:SetPoint("TOPRIGHT", cfg, "TOPRIGHT", -6, -6)
 
-local function Check(name, label, y, onClick)
+local function Check(name, label, y, onClick, x)
   local c = CreateFrame("CheckButton", name, cfg, "UICheckButtonTemplate")
-  c:SetPoint("TOPLEFT", cfg, "TOPLEFT", 20, y)
-  getglobal(name .. "Text"):SetText(label)
+  c:SetPoint("TOPLEFT", cfg, "TOPLEFT", x or 20, y)
+  c.label = c:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  c.label:SetPoint("LEFT", c, "RIGHT", 0, 1)
+  c.label:SetText(label)
   c:SetScript("OnClick", onClick)
   return c
 end
@@ -364,7 +423,7 @@ local cEnabled = Check("BattleMarksCheckEnabled", "Mark the party when a co-op m
   if not db.enabled then passes = {} end
   ButtonLook()
 end)
-local cBosses = Check("BattleMarksCheckBosses", "Skull on bosses (cross on a second one)", -72, function()
+local cBosses = Check("BattleMarksCheckBosses", "Skull and cross on bosses (or guardians)", -72, function()
   db.bosses = this:GetChecked() and true or false
   -- your own marker can't be a boss marker
   if Reserved(db.mine) then
@@ -374,10 +433,13 @@ local cBosses = Check("BattleMarksCheckBosses", "Skull on bosses (cross on a sec
   end
   Refresh()
 end)
-local cAnnounce = Check("BattleMarksCheckAnnounce", "Tell the party the markers in chat", -98, function()
+local cSolo = Check("BattleMarksCheckSolo", "Also when playing solo", -96, function()
+  db.bossesSolo = this:GetChecked() and true or false
+end, 44)
+local cAnnounce = Check("BattleMarksCheckAnnounce", "Tell the party the markers in chat", -122, function()
   db.announce = this:GetChecked() and true or false
 end)
-local cButton = Check("BattleMarksCheckButton", "Show the minimap button", -124, function()
+local cButton = Check("BattleMarksCheckButton", "Show the minimap button", -148, function()
   db.button = this:GetChecked() and true or false
   ButtonShown()
   if not db.button then Print("minimap button hidden: /bmarks opens the settings.") end
@@ -420,10 +482,10 @@ local function MarkerRow(y, onClick, onEnter)
   return row
 end
 
-Label("Your marker:", -164)
+Label("Your marker:", -188)
 local mineName = cfg:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-mineName:SetPoint("TOPLEFT", cfg, "TOPLEFT", 112, -164)
-local mineRow = MarkerRow(-184, function()
+mineName:SetPoint("TOPLEFT", cfg, "TOPLEFT", 112, -188)
+local mineRow = MarkerRow(-208, function()
   if SetMine(this.index) then Refresh() end
 end, function()
   GameTooltip:SetOwner(this, "ANCHOR_TOP")
@@ -432,11 +494,11 @@ end, function()
   GameTooltip:Show()
 end)
 
-Label("Markers for teammates:", -226)
+Label("Markers for teammates:", -250)
 local teamHint = cfg:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-teamHint:SetPoint("TOPLEFT", cfg, "TOPLEFT", 24, -242)
+teamHint:SetPoint("TOPLEFT", cfg, "TOPLEFT", 24, -266)
 teamHint:SetText("Click to turn one off or on.")
-local teamRow = MarkerRow(-260, function()
+local teamRow = MarkerRow(-284, function()
   local i = this.index
   if Reserved(i) then
     Print(Marker(i) .. " is kept for bosses while \"Skull on bosses\" is on.")
@@ -458,7 +520,7 @@ end, function()
 end)
 
 local who = cfg:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-who:SetPoint("TOPLEFT", cfg, "TOPLEFT", 24, -302)
+who:SetPoint("TOPLEFT", cfg, "TOPLEFT", 24, -326)
 who:SetWidth(262)
 who:SetJustifyH("LEFT")
 
@@ -482,6 +544,8 @@ Refresh = function()
   if not db or not cfg:IsShown() then return end
   cEnabled:SetChecked(db.enabled and 1 or nil)
   cBosses:SetChecked(db.bosses and 1 or nil)
+  cSolo:SetChecked(db.bossesSolo and 1 or nil)
+  if db.bosses then cSolo:Enable(); cSolo.label:SetTextColor(1, 1, 1) else cSolo:Disable(); cSolo.label:SetTextColor(0.5, 0.5, 0.5) end
   cAnnounce:SetChecked(db.announce and 1 or nil)
   cButton:SetChecked(db.button and 1 or nil)
   mineName:SetText(Marker(db.mine))
@@ -651,7 +715,7 @@ SlashCmdList["BATTLEMARKS"] = function(msg)
     ToggleConfig()
   elseif cmd == "status" then
     Print((db.enabled and "on" or "off") .. ", your marker: " .. Marker(db.mine) .. ", bosses: "
-      .. (db.bosses and "skull" or "off") .. ", party chat: " .. (db.announce and "on" or "off") .. ".")
+      .. (db.bosses and (db.bossesSolo and "on, solo too" or "on, in a party") or "off") .. ", party chat: " .. (db.announce and "on" or "off") .. ".")
     if GetNumPartyMembers() > 0 then
       local d = Decider()
       Print("in this party the markers are set by " .. (d == Me() and "you" or tostring(d)) .. ".")
