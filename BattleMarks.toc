@@ -1,6 +1,6 @@
 ## Interface: 11200
 ## Title: |cff66ccffBattle|rMarks
 ## Notes: Azeroth Survivors: numbered raid markers for you, your co-op party, and bosses and guardians, set when the match loads and told to the party in chat. Minimap button or /bmarks for settings.
-## Version: 0.5.0
+## Version: 0.6.0
 ## SavedVariables: BattleMarksDB
 BattleMarks.lua
